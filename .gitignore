@@ -1,0 +1,5 @@
+# editor / OS leftovers (e.g. LibreOffice lock files)
+.~lock.*#
+*.swp
+*~
+.DS_Store
