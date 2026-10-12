@@ -8,6 +8,7 @@ plus the Steam settings that make the display work. Tested with **Proton 10.0**.
 |---|---|---|
 | Spinner/black screen at startup, error dialog "Could not open ./sound/dn_aro.wav" (hidden behind the fullscreen window), crash when dismissed; later "Error reading extra bytes" | Wine's `mmioOpen` ignores the game's replacement of the default `"DOS "` I/O procedure (the game serves its sounds out of `.zpr` archives that way), and `mmioSeek` reports position 0 for the game's handler | the shim (always on) |
 | Mouse cursor ghosting: stale copies of the target cursor smear across the background in menus and missions | The game's software-cursor erase assumes `Flip` leaves the back buffer intact for system-memory flip chains; Wine swaps the textures instead | the shim (on by default) |
+| Menus: the highlighted item is not the one under the cursor (clicks still hit the right item) | In menus the game acquires the DirectInput mouse exclusively and tracks its own position; Windows then sends it no mouse-move messages, but Wine still does, from the OS pointer (parked in the corner and clamped), and the highlight code follows those | the shim (on by default): drops `WM_MOUSEMOVE` at the game's `WH_MOUSE` hook while the game is polling the DirectInput mouse (menus). In missions it does not poll, takes the pointer from the messages, and they are left alone |
 | Fortress Builder: "Cannot SafeLock surface", crash | The game briefly leaves exclusive mode; Wine then reports the whole desktop (e.g. 6144x3456) as the display mode and flags the game's 640x480 surfaces lost | run inside a 640x480 display: a Wine virtual desktop (set up by `launch.sh`) |
 | Intro/promo videos are a black screen (audio plays) | Wine's fullscreen-exclusive presentation of the 8-bit palettized screen shows black (the frames are correct in memory; seen on Proton 10.0 and Experimental). In a window they display fine | Wine 640x480 virtual desktop (set up by `launch.sh`), scaled to fullscreen by gamescope |
 
@@ -35,7 +36,8 @@ Use the 1998 `smackw32.dll` that ships in the payload (95,232 bytes); a 2002 bui
 
 ## Options (environment variables for the shim)
 - `MMIOFIX_EXP=none` turn off the Flip fix (the mmio fix cannot be turned off). Other values (`blt`, `nosrc`, `touch`, `sync*`, `trace`) are diagnostic experiments.
-- `MMIOFIX_LOG=1` write `mmiofix.log` in the game folder. `MMIOFIX_AUTODUMP=8` dump front/back buffers as BMP every 8 s (F11 or a file named `dump.now` dumps once).
+- `MMIOFIX_MOUSE=off` turn off the menu highlight fix.
+- `MMIOFIX_LOG=1` write `mmiofix.log` in the game folder (also logs the mouse calls and every menu/mission mouse-mode switch). `MMIOFIX_AUTODUMP=8` dump front/back buffers as BMP every 8 s (F11 or a file named `dump.now` dumps once).
 
 ## Status / not covered
 - Tested: startup, main menu, options, Fortress Builder, unit library, single-mission setup, playing a mission, quitting. Sound and music work.

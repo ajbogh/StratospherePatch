@@ -15,6 +15,8 @@
 #include <windows.h>
 #include <mmsystem.h>
 #include <ddraw.h>
+#define DIRECTINPUT_VERSION 0x0500
+#include <dinput.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -80,6 +82,82 @@ static LPMMIOPROC WINAPI my_mmioInstallIOProcA(FOURCC fcc, LPMMIOPROC proc, DWOR
     return ret;
 }
 
+
+/* ---- mouse diagnostics: log the user32 cursor/coordinate calls the game uses (MMIOFIX_LOG=1) ---- */
+static BOOL (WINAPI *real_SetCursorPos)(int, int);
+static BOOL (WINAPI *real_ClipCursor)(const RECT *);
+static BOOL (WINAPI *real_ClientToScreen)(HWND, POINT *);
+static BOOL (WINAPI *real_ScreenToClient)(HWND, POINT *);
+static HHOOK (WINAPI *real_SetWindowsHookExA)(int, HOOKPROC, HINSTANCE, DWORD);
+/*
+ * The game acquires the DirectInput mouse in exclusive mode and tracks its own position from the DI deltas.
+ * Windows then sends it no mouse-move messages; Wine still does, from the (parked, clamped) OS pointer, and the
+ * game's highlight code follows those, so the highlight drifts away from the cursor it draws.
+ * Fix (default on): drop WM_MOUSEMOVE at the game's own WH_MOUSE hook. MMIOFIX_MOUSE=off disables it.
+ */
+static int g_mouse_swallow = 1;
+static volatile DWORD g_di_poll;        /* tick of the game's last poll of the DirectInput mouse */
+static int g_swallow_state = -1;
+static void mlog(const char *fmt, int a, int b, int c, int d);
+static HOOKPROC g_game_mouse_hook;
+static LRESULT CALLBACK my_mouse_hook(int code, WPARAM w, LPARAM l)
+{
+    if (code >= 0 && (w == WM_MOUSEMOVE || w == WM_NCMOUSEMOVE))
+    {
+        /* menu mode: the game polls the DI mouse every frame and ignores the OS pointer; mission mode: it does not poll
+         * and takes the position from these messages, so only drop them while the DI mouse is being polled */
+        int dropping = g_di_poll && (GetTickCount() - g_di_poll) < 250;
+        if (dropping != g_swallow_state) { g_swallow_state = dropping; mlog("mouse mode: %d (1 = menu/DirectInput, 0 = mission/OS messages)%d%d%d", dropping, 0, 0, 0); }
+        if (dropping) return 1;                       /* nonzero: message is not delivered */
+    }
+    return g_game_mouse_hook(code, w, l);
+}
+static unsigned g_mlines;
+static void mlog(const char *fmt, int a, int b, int c, int d)
+{
+    char buf[256], out[320]; DWORD n;
+    if (!g_log || g_log == INVALID_HANDLE_VALUE || g_mlines++ > 60000) return;
+    wsprintfA(buf, fmt, a, b, c, d);
+    SYSTEMTIME st; GetLocalTime(&st);
+    n = wsprintfA(out, "[mouse %02d:%02d:%02d.%03d] %s\r\n", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, buf);
+    WriteFile(g_log, out, n, &n, NULL);
+}
+static HHOOK WINAPI my_SetWindowsHookExA(int id, HOOKPROC fn, HINSTANCE inst, DWORD tid)
+{
+    HHOOK h;
+    if (g_mouse_swallow && id == WH_MOUSE && fn) { g_game_mouse_hook = fn; fn = my_mouse_hook; mlog("swallowing WM_MOUSEMOVE at WH_MOUSE hook%d%d%d%d", 0, 0, 0, 0); }
+    h = real_SetWindowsHookExA(id, fn, inst, tid);
+    mlog("SetWindowsHookExA(idHook=%d, thread=%d) -> %d%d", id, (int)tid, h != NULL, 0);
+    return h;
+}
+static BOOL WINAPI my_SetCursorPos(int x, int y)
+{
+    POINT p = {-1, -1}; BOOL r = real_SetCursorPos(x, y);
+    GetCursorPos(&p);
+    mlog("SetCursorPos(%d,%d) -> now at %d,%d", x, y, p.x, p.y);
+    return r;
+}
+static BOOL WINAPI my_ClipCursor(const RECT *rc)
+{
+    if (rc) mlog("ClipCursor(%d,%d,%d,%d)", rc->left, rc->top, rc->right, rc->bottom);
+    else mlog("ClipCursor(NULL)%d%d%d%d", 0, 0, 0, 0);
+    return real_ClipCursor(rc);
+}
+static BOOL WINAPI my_ClientToScreen(HWND h, POINT *p)
+{
+    int x = p ? p->x : 0, y = p ? p->y : 0; BOOL r = real_ClientToScreen(h, p);
+    RECT w = {0}; GetWindowRect(h, &w);
+    if (p) mlog("ClientToScreen(%d,%d) -> %d,%d", x, y, p->x, p->y);
+    mlog("  window rect %d,%d,%d,%d", w.left, w.top, w.right, w.bottom);
+    return r;
+}
+static BOOL WINAPI my_ScreenToClient(HWND h, POINT *p)
+{
+    int x = p ? p->x : 0, y = p ? p->y : 0; BOOL r = real_ScreenToClient(h, p);
+    if (p) mlog("ScreenToClient(%d,%d) -> %d,%d", x, y, p->x, p->y);
+    return r;
+}
+
 static int patch_iat(HMODULE exe)
 {
     BYTE *base = (BYTE *)exe;
@@ -92,7 +170,8 @@ static int patch_iat(HMODULE exe)
     for (imp = (IMAGE_IMPORT_DESCRIPTOR *)(base + dd->VirtualAddress); imp->Name; imp++)
     {
         IMAGE_THUNK_DATA *oft, *ft;
-        if (lstrcmpiA((char *)(base + imp->Name), "winmm.dll")) continue;
+        int is_u32 = !lstrcmpiA((char *)(base + imp->Name), "user32.dll");
+        if (lstrcmpiA((char *)(base + imp->Name), "winmm.dll") && !is_u32) continue;
         oft = (IMAGE_THUNK_DATA *)(base + (imp->OriginalFirstThunk ? imp->OriginalFirstThunk : imp->FirstThunk));
         ft = (IMAGE_THUNK_DATA *)(base + imp->FirstThunk);
         for (; oft->u1.AddressOfData; oft++, ft++)
@@ -101,7 +180,16 @@ static int patch_iat(HMODULE exe)
             void *repl = NULL; DWORD old;
             if (IMAGE_SNAP_BY_ORDINAL32(oft->u1.Ordinal)) continue;
             ibn = (IMAGE_IMPORT_BY_NAME *)(base + oft->u1.AddressOfData);
-            if (!strcmp((char *)ibn->Name, "mmioOpenA")) { real_mmioOpenA = (void *)ft->u1.Function; repl = my_mmioOpenA; }
+            if (is_u32)
+            {
+                if (!strcmp((char *)ibn->Name, "SetWindowsHookExA") ? !(g_log || g_mouse_swallow) : !g_log) continue;
+                if (!strcmp((char *)ibn->Name, "SetCursorPos")) { real_SetCursorPos = (void *)ft->u1.Function; repl = my_SetCursorPos; }
+                else if (!strcmp((char *)ibn->Name, "SetWindowsHookExA")) { real_SetWindowsHookExA = (void *)ft->u1.Function; repl = my_SetWindowsHookExA; }
+                else if (!strcmp((char *)ibn->Name, "ClipCursor")) { real_ClipCursor = (void *)ft->u1.Function; repl = my_ClipCursor; }
+                else if (!strcmp((char *)ibn->Name, "ClientToScreen")) { real_ClientToScreen = (void *)ft->u1.Function; repl = my_ClientToScreen; }
+                else if (!strcmp((char *)ibn->Name, "ScreenToClient")) { real_ScreenToClient = (void *)ft->u1.Function; repl = my_ScreenToClient; }
+            }
+            else if (!strcmp((char *)ibn->Name, "mmioOpenA")) { real_mmioOpenA = (void *)ft->u1.Function; repl = my_mmioOpenA; }
             else if (!strcmp((char *)ibn->Name, "mmioInstallIOProcA")) { real_mmioInstallIOProcA = (void *)ft->u1.Function; repl = my_mmioInstallIOProcA; }
             if (!repl) continue;
             VirtualProtect(&ft->u1.Function, sizeof(void *), PAGE_READWRITE, &old);
@@ -156,6 +244,8 @@ static unsigned ch(DWORD px, DWORD mask)
     return bits >= 8 ? v >> (bits - 8) : (v * 255) / ((1u << bits) - 1);
 }
 
+static PALETTEENTRY g_pal[256]; static int g_have_pal;
+
 static void dump_surface(IDirectDrawSurface2 *s, const char *tag)
 {
     DDSURFACEDESC d; char name[64]; HANDLE f; DWORD n; unsigned x, y, w, h, bpp, rowsz;
@@ -177,7 +267,7 @@ static void dump_surface(IDirectDrawSurface2 *s, const char *tag)
         for (x = 0; x < w; x++)
         {
             DWORD px = bpp == 32 ? ((DWORD *)src)[x] : bpp == 16 ? ((WORD *)src)[x] : src[x];
-            if (bpp == 8) { row[x*3] = row[x*3+1] = row[x*3+2] = (BYTE)px; }
+            if (bpp == 8) { if (g_have_pal) { row[x*3] = g_pal[px&255].peBlue; row[x*3+1] = g_pal[px&255].peGreen; row[x*3+2] = g_pal[px&255].peRed; } else row[x*3] = row[x*3+1] = row[x*3+2] = (BYTE)px; }
             else { row[x*3] = ch(px, d.ddpfPixelFormat.dwBBitMask); row[x*3+1] = ch(px, d.ddpfPixelFormat.dwGBitMask); row[x*3+2] = ch(px, d.ddpfPixelFormat.dwRBitMask); }
         }
         WriteFile(f, row, rowsz, &n, NULL);
@@ -206,6 +296,22 @@ static void maybe_dump(IDirectDrawSurface2 *front)
     }
     if (!want) return;
     g_dumpseq++;
+    g_have_pal = 0;
+    {
+        IDirectDrawPalette *pal = NULL;
+        if (IDirectDrawSurface2_GetPalette(front, &pal) == DD_OK && pal)
+        {
+            if (IDirectDrawPalette_GetEntries(pal, 0, 0, 256, g_pal) == DD_OK)
+            {
+                g_have_pal = 1;
+                logs("palette: [0]=%02x%02x%02x", g_pal[0].peRed, g_pal[0].peGreen, g_pal[0].peBlue);
+                logs("palette: [1]=%02x%02x%02x [128]=%02x", g_pal[1].peRed, g_pal[1].peGreen, g_pal[1].peBlue);
+                logs("palette: [255]=%02x%02x%02x", g_pal[255].peRed, g_pal[255].peGreen, g_pal[255].peBlue);
+            }
+            IDirectDrawPalette_Release(pal);
+        }
+        else logs("front has no palette (hr failed)", 0, 0, 0);
+    }
     dump_surface(front, "front");
     { IDirectDrawSurface2 *back = get_back(front); if (back) { dump_surface(back, "back"); IDirectDrawSurface2_Release(back); } }
 }
@@ -341,6 +447,21 @@ static HRESULT STDMETHODCALLTYPE my_BltFast(IDirectDrawSurface2 *This, DWORD x, 
     return hr;
 }
 
+static HRESULT (STDMETHODCALLTYPE *orig_Flip1)(IDirectDrawSurface *, IDirectDrawSurface *, DWORD);
+static HRESULT STDMETHODCALLTYPE my_Flip1(IDirectDrawSurface *This, IDirectDrawSurface *target, DWORD flags)
+{
+    HRESULT hr = orig_Flip1(This, target, flags);
+    IDirectDrawSurface2 *s2 = NULL;
+    g_flips++;
+    if (g_flips <= 6) logs("Flip1 #%u flags=%08x", g_flips, flags, 0);
+    if (IDirectDrawSurface_QueryInterface(This, &IID_IDirectDrawSurface2, (void **)&s2) == DD_OK && s2)
+    {
+        maybe_dump(s2);
+        IDirectDrawSurface2_Release(s2);
+    }
+    return hr;
+}
+
 static void install_dd_hooks(void)
 {
     static int done;
@@ -375,6 +496,12 @@ static void install_dd_hooks(void)
             orig_Blt = (void *)vtbl[5]; vtbl[5] = (void *)my_Blt;
             orig_BltFast = (void *)vtbl[7]; vtbl[7] = (void *)my_BltFast;
             VirtualProtect(&vtbl[5], 3 * sizeof(void *), old, &old);
+            {
+                void **v1 = (void **)s1->lpVtbl;
+                VirtualProtect(&v1[11], sizeof(void *), PAGE_READWRITE, &old);
+                orig_Flip1 = (void *)v1[11]; v1[11] = (void *)my_Flip1;
+                VirtualProtect(&v1[11], sizeof(void *), old, &old);
+            }
             logs("ddraw hook installed, exp=%u", g_exp, 0, 0);
             IDirectDrawSurface2_Release(s2);
         }
@@ -384,9 +511,85 @@ static void install_dd_hooks(void)
     IDirectDraw_Release(d);
 }
 
-__declspec(dllexport) HRESULT WINAPI DirectInputCreateA(HINSTANCE hinst, DWORD ver, void **out, void *outer)
+
+/* ---- DirectInput mouse diagnostics (MMIOFIX_LOG=1) ---- */
+static void *g_mouse_dev;
+static HRESULT (STDMETHODCALLTYPE *orig_CreateDevice)(IDirectInputA *, REFGUID, IDirectInputDeviceA **, IUnknown *);
+static HRESULT (STDMETHODCALLTYPE *orig_GetDeviceState)(IDirectInputDeviceA *, DWORD, void *);
+static HRESULT (STDMETHODCALLTYPE *orig_GetDeviceData)(IDirectInputDeviceA *, DWORD, DIDEVICEOBJECTDATA *, DWORD *, DWORD);
+static HRESULT (STDMETHODCALLTYPE *orig_SetProperty)(IDirectInputDeviceA *, REFGUID, const DIPROPHEADER *);
+static HRESULT (STDMETHODCALLTYPE *orig_SetCoop)(IDirectInputDeviceA *, HWND, DWORD);
+static HRESULT (STDMETHODCALLTYPE *orig_SetDataFormat)(IDirectInputDeviceA *, const DIDATAFORMAT *);
+
+static HRESULT STDMETHODCALLTYPE my_GetDeviceState(IDirectInputDeviceA *This, DWORD cb, void *data)
 {
-    static HRESULT (WINAPI *fn)(HINSTANCE, DWORD, void **, void *);
+    HRESULT r = orig_GetDeviceState(This, cb, data);
+    if ((void *)This == g_mouse_dev) g_di_poll = GetTickCount() | 1;
+    if ((void *)This == g_mouse_dev && r == DI_OK && cb >= 12)
+    {
+        DIMOUSESTATE *m = (DIMOUSESTATE *)data; POINT p = {-1, -1};
+        static int sx, sy;
+        if (m->lX || m->lY) { sx += m->lX; sy += m->lY; GetCursorPos(&p); mlog("DI dx=%d dy=%d sum=%d,%d", m->lX, m->lY, sx, sy); mlog("  os cursor %d,%d%d%d", p.x, p.y, 0, 0); }
+    }
+    return r;
+}
+static HRESULT STDMETHODCALLTYPE my_GetDeviceData(IDirectInputDeviceA *This, DWORD cbo, DIDEVICEOBJECTDATA *d, DWORD *n, DWORD fl)
+{
+    HRESULT r = orig_GetDeviceData(This, cbo, d, n, fl);
+    if ((void *)This == g_mouse_dev) g_di_poll = GetTickCount() | 1;
+    if ((void *)This == g_mouse_dev && d && n && SUCCEEDED(r))
+    {
+        DWORD i; POINT p = {-1, -1}; if (*n) GetCursorPos(&p);
+        for (i = 0; i < *n && i < 8; i++) mlog("DI data ofs=%d val=%d  (cursor %d,%d)", d[i].dwOfs, (int)d[i].dwData, p.x, p.y);
+    }
+    return r;
+}
+static HRESULT STDMETHODCALLTYPE my_SetProperty(IDirectInputDeviceA *This, REFGUID g, const DIPROPHEADER *h)
+{
+    if ((void *)This == g_mouse_dev && h)
+        mlog("DI SetProperty(prop=%d) obj=%d how=%d", (int)(DWORD_PTR)g, h->dwObj, h->dwHow, h->dwSize >= 20 ? (int)((DIPROPDWORD *)h)->dwData : -1);
+    return orig_SetProperty(This, g, h);
+}
+static HRESULT STDMETHODCALLTYPE my_SetCoop(IDirectInputDeviceA *This, HWND w, DWORD fl)
+{
+    if ((void *)This == g_mouse_dev) mlog("DI mouse SetCooperativeLevel(flags=%x)%d%d%d", fl, 0, 0, 0);
+    return orig_SetCoop(This, w, fl);
+}
+static HRESULT STDMETHODCALLTYPE my_SetDataFormat(IDirectInputDeviceA *This, const DIDATAFORMAT *f)
+{
+    if ((void *)This == g_mouse_dev && f)
+        mlog("DI mouse SetDataFormat(size=%d flags=%x objs=%d)", f->dwDataSize, f->dwFlags, f->dwNumObjs, 0);
+    return orig_SetDataFormat(This, f);
+}
+static void patch_vt(void **vt, int idx, void *fn, void **orig)
+{
+    DWORD old;
+    if (*orig || vt[idx] == fn) return;
+    *orig = vt[idx];
+    VirtualProtect(&vt[idx], sizeof(void *), PAGE_READWRITE, &old);
+    vt[idx] = fn;
+    VirtualProtect(&vt[idx], sizeof(void *), old, &old);
+}
+static HRESULT STDMETHODCALLTYPE my_CreateDevice(IDirectInputA *This, REFGUID g, IDirectInputDeviceA **out, IUnknown *outer)
+{
+    HRESULT r = orig_CreateDevice(This, g, out, outer);
+    if (SUCCEEDED(r) && out && *out && IsEqualGUID(g, &GUID_SysMouse))
+    {
+        void **vt = *(void ***)*out;
+        g_mouse_dev = *out;
+        mlog("DI CreateDevice(SysMouse) -> %d%d%d%d", 1, 0, 0, 0);
+        patch_vt(vt, 9, my_GetDeviceState, (void **)&orig_GetDeviceState);
+        patch_vt(vt, 10, my_GetDeviceData, (void **)&orig_GetDeviceData);
+        patch_vt(vt, 6, my_SetProperty, (void **)&orig_SetProperty);
+        patch_vt(vt, 11, my_SetDataFormat, (void **)&orig_SetDataFormat);
+        patch_vt(vt, 13, my_SetCoop, (void **)&orig_SetCoop);
+    }
+    return r;
+}
+
+__declspec(dllexport) HRESULT WINAPI DirectInputCreateA(HINSTANCE hinst, DWORD ver, LPDIRECTINPUTA *out, LPUNKNOWN outer)
+{
+    static HRESULT (WINAPI *fn)(HINSTANCE, DWORD, LPDIRECTINPUTA *, LPUNKNOWN);
     install_dd_hooks();
     if (!fn)
     {
@@ -397,7 +600,16 @@ __declspec(dllexport) HRESULT WINAPI DirectInputCreateA(HINSTANCE hinst, DWORD v
         m = LoadLibraryA(path);
         if (m) fn = (void *)GetProcAddress(m, "DirectInputCreateA");
     }
-    return fn ? fn(hinst, ver, out, outer) : E_FAIL;
+    {
+        HRESULT hr = fn ? fn(hinst, ver, out, outer) : E_FAIL;
+        if (SUCCEEDED(hr) && out && *out)
+        {
+            IDirectInputA *di = (IDirectInputA *)*out;
+            patch_vt(*(void ***)di, 3, my_CreateDevice, (void **)&orig_CreateDevice);
+            mlog("DirectInputCreateA ver=%x%d%d%d", ver, 0, 0, 0);
+        }
+        return hr;
+    }
 }
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *res)
@@ -408,6 +620,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, void *res)
         DisableThreadLibraryCalls(inst);
         if (GetEnvironmentVariableA("MMIOFIX_LOG", tmp, sizeof(tmp)))
             g_log = CreateFileA("mmiofix.log", GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, 0, NULL);
+        if (GetEnvironmentVariableA("MMIOFIX_MOUSE", tmp, sizeof(tmp)) && !strcmp(tmp, "off")) g_mouse_swallow = 0;
         logf_("loaded, patched %s imports: %u", "winmm", patch_iat(GetModuleHandleW(NULL)));
     }
     return TRUE;
