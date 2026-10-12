@@ -1,17 +1,17 @@
 # Stratosphere: Conquest of the Skies - Linux / Proton patch
 
-Makes the 1998 game *Stratosphere: Conquest of the Skies* run under **Steam + Proton 10.0**: sound, music, intro videos, menus, Fortress Builder and missions.
+Makes the 1998 game *Stratosphere: Conquest of the Skies* run under **Steam + Proton** (Proton 10.0 or Proton Experimental): sound, music, intro videos, menus, Fortress Builder and missions.
 This repository contains only the patch files. **You need your own copy of the game.**
 
 ## You need
-- Steam with **Proton 10.0**
+- Steam with **Proton 10.0** (Proton Experimental should work too)
 - [gamescope](https://github.com/ValveSoftware/gamescope) (`sudo apt install gamescope` or your distro's equivalent)
 - Your copy of the game installer (`Stratosphere.exe`)
 - From this repository: `dinput.dll` and `launch.sh`
 
 ## Install
 1. **Install the game.** In Steam choose *Games -> Add a Non-Steam Game* and add the installer `Stratosphere.exe`.
-   Open its *Properties -> Compatibility*, tick *Force the use of a specific Steam Play compatibility tool* and pick **Proton 10.0**.
+   Open its *Properties -> Compatibility*, tick *Force the use of a specific Steam Play compatibility tool* and pick **Proton 10.0** (or Proton Experimental).
    Click *Play*, run the installer and pick the **Full** install. Remember the folder it installs to (the one that contains `strat.exe`).
 2. **Point Steam at the game.** Open the same entry's *Properties* and set *Target* to `strat.exe` in that folder and *Start In* to the folder.
 3. **Add the patch files.** Copy `dinput.dll` and `launch.sh` from this repository into the game folder, next to `strat.exe`, then run `chmod +x launch.sh`.
@@ -23,7 +23,7 @@ This repository contains only the patch files. **You need your own copy of the g
 5. **Play.** The first launch takes a little longer and shows a blue background once; after that the background is black.
 
 ## Notes
-- Tested with Proton 10.0 on Ubuntu with an AMD GPU. Multiplayer is untested.
+- Fully tested with Proton 10.0 on Ubuntu with an AMD GPU. Proton Experimental also ran the game with the patch in our tests. Multiplayer is untested.
 - The game is from 1998 and a bit glitchy even on Windows.
 - Something not working? See [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md) for what the patch does, and [open an issue](../../issues).
 
