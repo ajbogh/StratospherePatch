@@ -97,6 +97,7 @@ static HHOOK (WINAPI *real_SetWindowsHookExA)(int, HOOKPROC, HINSTANCE, DWORD);
  */
 static int g_mouse_swallow = 1;
 static volatile DWORD g_di_poll;        /* tick of the game's last poll of the DirectInput mouse */
+static volatile LONG g_di_polled;       /* set once the game has polled it */
 static int g_swallow_state = -1;
 static void mlog(const char *fmt, int a, int b, int c, int d);
 static HOOKPROC g_game_mouse_hook;
@@ -106,7 +107,7 @@ static LRESULT CALLBACK my_mouse_hook(int code, WPARAM w, LPARAM l)
     {
         /* menu mode: the game polls the DI mouse every frame and ignores the OS pointer; mission mode: it does not poll
          * and takes the position from these messages, so only drop them while the DI mouse is being polled */
-        int dropping = g_di_poll && (GetTickCount() - g_di_poll) < 250;
+        int dropping = g_di_polled && (int)(GetTickCount() - g_di_poll) < 250;
         if (dropping != g_swallow_state) { g_swallow_state = dropping; mlog("mouse mode: %d (1 = menu/DirectInput, 0 = mission/OS messages)%d%d%d", dropping, 0, 0, 0); }
         if (dropping) return 1;                       /* nonzero: message is not delivered */
     }
@@ -524,7 +525,7 @@ static HRESULT (STDMETHODCALLTYPE *orig_SetDataFormat)(IDirectInputDeviceA *, co
 static HRESULT STDMETHODCALLTYPE my_GetDeviceState(IDirectInputDeviceA *This, DWORD cb, void *data)
 {
     HRESULT r = orig_GetDeviceState(This, cb, data);
-    if ((void *)This == g_mouse_dev) g_di_poll = GetTickCount() | 1;
+    if ((void *)This == g_mouse_dev) { g_di_poll = GetTickCount(); g_di_polled = 1; }
     if ((void *)This == g_mouse_dev && r == DI_OK && cb >= 12)
     {
         DIMOUSESTATE *m = (DIMOUSESTATE *)data; POINT p = {-1, -1};
@@ -536,7 +537,7 @@ static HRESULT STDMETHODCALLTYPE my_GetDeviceState(IDirectInputDeviceA *This, DW
 static HRESULT STDMETHODCALLTYPE my_GetDeviceData(IDirectInputDeviceA *This, DWORD cbo, DIDEVICEOBJECTDATA *d, DWORD *n, DWORD fl)
 {
     HRESULT r = orig_GetDeviceData(This, cbo, d, n, fl);
-    if ((void *)This == g_mouse_dev) g_di_poll = GetTickCount() | 1;
+    if ((void *)This == g_mouse_dev) { g_di_poll = GetTickCount(); g_di_polled = 1; }
     if ((void *)This == g_mouse_dev && d && n && SUCCEEDED(r))
     {
         DWORD i; POINT p = {-1, -1}; if (*n) GetCursorPos(&p);
