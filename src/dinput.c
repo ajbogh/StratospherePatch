@@ -103,7 +103,14 @@ static void mlog(const char *fmt, int a, int b, int c, int d);
 static HOOKPROC g_game_mouse_hook;
 static LRESULT CALLBACK my_mouse_hook(int code, WPARAM w, LPARAM l)
 {
-    if (code >= 0 && (w == WM_MOUSEMOVE || w == WM_NCMOUSEMOVE))
+    if (code >= 0 && w != WM_MOUSEMOVE && w != WM_NCMOUSEMOVE)
+    {
+        MOUSEHOOKSTRUCT *mh = (MOUSEHOOKSTRUCT *)l;
+        mlog("hook msg=%x pt=%d,%d", (int)w, mh->pt.x, mh->pt.y, 0);
+    }
+    /* every mouse message: Windows sends none while the DI mouse is exclusive; a duplicate button up/down from here
+     * re-triggers what the DI click already did (dropdowns that open and instantly close) */
+    if (code >= 0 && ((w >= WM_MOUSEFIRST && w <= 0x20E) || (w >= WM_NCMOUSEMOVE && w <= 0xA9)))
     {
         /* menu mode: the game polls the DI mouse every frame and ignores the OS pointer; mission mode: it does not poll
          * and takes the position from these messages, so only drop them while the DI mouse is being polled */
@@ -529,7 +536,9 @@ static HRESULT STDMETHODCALLTYPE my_GetDeviceState(IDirectInputDeviceA *This, DW
     if ((void *)This == g_mouse_dev && r == DI_OK && cb >= 12)
     {
         DIMOUSESTATE *m = (DIMOUSESTATE *)data; POINT p = {-1, -1};
-        static int sx, sy;
+        static int sx, sy; static DWORD lastb;
+        DWORD b = *(DWORD *)m->rgbButtons & 0x80808080;
+        if (cb >= 16 && b != lastb) { lastb = b; mlog("DI buttons=%08x (down=%d%d%d)", (int)b, 0, 0, 0); }
         if (m->lX || m->lY) { sx += m->lX; sy += m->lY; GetCursorPos(&p); mlog("DI dx=%d dy=%d sum=%d,%d", m->lX, m->lY, sx, sy); mlog("  os cursor %d,%d%d%d", p.x, p.y, 0, 0); }
     }
     return r;
